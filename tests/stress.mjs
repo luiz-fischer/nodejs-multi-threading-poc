@@ -1,5 +1,6 @@
 import process from 'node:process'
 import { performance } from 'node:perf_hooks'
+import { createHash } from 'node:crypto'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'
 import {
@@ -38,7 +39,13 @@ if (!Number.isInteger(concurrency) || concurrency < 1) {
   throw new Error('STRESS_CONCURRENCY must be a positive integer')
 }
 
-const body = JSON.stringify({ text: 'x'.repeat(payloadBytes) })
+if (!Number.isInteger(requestTimeoutMs) || requestTimeoutMs < 1) {
+  throw new Error('STRESS_TIMEOUT_MS must be a positive integer')
+}
+
+const payload = 'x'.repeat(payloadBytes)
+const body = JSON.stringify({ text: payload })
+const expectedPayloadBytes = Buffer.byteLength(payload, 'utf8')
 
 function isUuidV7(value) {
   return typeof value === 'string' &&
@@ -53,6 +60,28 @@ function percentile(values, fraction) {
 
 function formatMs(value) {
   return `${value.toFixed(2)} ms`
+}
+
+function calculateExpectedHash(text, rounds) {
+  let digest = ''
+  for (let round = 0; round < rounds; round += 1) {
+    digest = createHash('sha256').update(text, 'utf8').digest('hex')
+  }
+  return digest
+}
+
+function calculateExpectedFingerprint(rounds, payloadHash) {
+  const fingerprintSource = JSON.stringify({
+    algorithm: 'sha256',
+    encoding: 'utf8',
+    rounds,
+    payloadBytes: expectedPayloadBytes,
+    payloadHash
+  })
+
+  return createHash('sha256')
+    .update(fingerprintSource, 'utf8')
+    .digest('hex')
 }
 
 async function waitForServer() {
@@ -99,6 +128,12 @@ async function request(path, method = 'POST') {
       data,
       durationMs: performance.now() - startedAt
     }
+  } catch (error) {
+    if (controller.signal.aborted) {
+      throw new Error(`${method} ${path} timed out after ${requestTimeoutMs} ms`)
+    }
+
+    throw error
   } finally {
     clearTimeout(timeout)
   }
@@ -111,6 +146,9 @@ async function runCase(testCase) {
   const trackIds = new Set()
   const processIds = new Set()
   const hashRounds = new Set()
+  let expectedHash
+  let expectedFingerprint
+  let workloadProof
   const violations = []
   const errors = []
   const resourceSnapshots = []
@@ -150,6 +188,7 @@ async function runCase(testCase) {
       try {
         const result = await request(testCase.path)
         const execution = result.data.execution
+        const workload = result.data.workload
 
         durations.push(result.durationMs)
 
@@ -179,6 +218,36 @@ async function runCase(testCase) {
 
         if (!Number.isInteger(execution.hashRounds) || execution.hashRounds < 1) {
           violations.push({ requestNumber, reason: 'invalid hashRounds value', execution })
+        }
+
+        expectedHash ??= calculateExpectedHash(payload, execution.hashRounds)
+        expectedFingerprint ??= calculateExpectedFingerprint(execution.hashRounds, expectedHash)
+
+        if (result.data.hash !== expectedHash) {
+          violations.push({ requestNumber, reason: 'hash result differs from the shared workload', execution })
+        }
+
+        const validWorkload = workload &&
+          workload.algorithm === 'sha256' &&
+          workload.encoding === 'utf8' &&
+          workload.rounds === execution.hashRounds &&
+          workload.payloadBytes === expectedPayloadBytes &&
+          workload.inputFingerprint === expectedFingerprint
+
+        if (!validWorkload) {
+          violations.push({
+            requestNumber,
+            reason: 'workload input or fingerprint differs from the shared contract',
+            workload,
+            expectedFingerprint
+          })
+          continue
+        }
+
+        workloadProof ??= workload
+
+        if (JSON.stringify(workload) !== JSON.stringify(workloadProof)) {
+          violations.push({ requestNumber, reason: 'workload proof changed between requests', workload })
         }
       } catch (error) {
         errors.push({ requestNumber, message: error instanceof Error ? error.message : String(error) })
@@ -232,6 +301,8 @@ async function runCase(testCase) {
     probeP95Ms: percentile(probeDurations, 0.95),
     trackIds: trackIds.size,
     hashRounds: [...hashRounds][0],
+    hash: expectedHash,
+    workload: workloadProof,
     resourceSamples: resourceSnapshots.length,
     resourcePeaks: {
       eventLoopLagSeconds: resourcePeak('app.event_loop.lag'),
@@ -247,7 +318,7 @@ async function runCase(testCase) {
 
 console.log(`Stress test: ${baseUrl}`)
 console.log(`Requests=${totalRequests}, concurrency=${concurrency}, payload=${payloadBytes} bytes`)
-console.log('Each response is checked for mode, isMainThread, threadId and pid.')
+console.log('Each response is checked for execution context, shared workload input and payload fingerprint.')
 
 await waitForServer()
 
@@ -270,6 +341,16 @@ try {
     console.log(`  process IDs: ${result.processIds.join(', ') || 'none'}`)
     console.log(`  worker thread count: ${result.threadIds.length}`)
     console.log(`  track IDs: ${result.trackIds}/${result.requests}`)
+    console.log(`  workload fingerprint: ${result.workload.inputFingerprint}`)
+  }
+
+  const workloadContracts = new Set(results.map((result) => JSON.stringify({
+    hash: result.hash,
+    workload: result.workload
+  })))
+
+  if (workloadContracts.size !== 1) {
+    throw new Error('The processing modes did not execute the same workload contract')
   }
 } catch (error) {
   await mkdir(dirname(outputPath), { recursive: true })
@@ -280,6 +361,7 @@ try {
     totalRequests,
     concurrency,
     payloadBytes,
+    requestTimeoutMs,
     results,
     error: error instanceof Error ? error.message : String(error)
   }, null, 2))

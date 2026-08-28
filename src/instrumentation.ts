@@ -6,7 +6,7 @@ import {
   InMemoryMetricExporter,
   PeriodicExportingMetricReader
 } from '@opentelemetry/sdk-metrics'
-import { ConsoleSpanExporter } from '@opentelemetry/sdk-trace-node'
+import { ConsoleSpanExporter, SimpleSpanProcessor } from '@opentelemetry/sdk-trace-node'
 import { isMainThread } from 'node:worker_threads'
 import {
   OTEL_CONSOLE_EXPORTER_ENABLED,
@@ -40,7 +40,9 @@ if (OTEL_CONSOLE_EXPORTER_ENABLED && isMainThread) {
 
 const sdk = isMainThread
   ? new NodeSDK({
-      traceExporter: OTEL_CONSOLE_EXPORTER_ENABLED ? new ConsoleSpanExporter() : undefined,
+      spanProcessors: OTEL_CONSOLE_EXPORTER_ENABLED
+        ? [new SimpleSpanProcessor(new ConsoleSpanExporter())]
+        : [],
       metricReaders,
       instrumentations: [getNodeAutoInstrumentations()]
     })

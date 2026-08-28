@@ -4,7 +4,6 @@ import {
   hashJobsStarted,
   startHashJobTimer
 } from './metrics.js'
-import { createUuidV7, getRequestContext } from './track-context.js'
 import { WorkerPool } from './worker-pool.js'
 import type { HashResult, WorkerData } from './types.js'
 
@@ -19,12 +18,11 @@ function getWorkerPool(): WorkerPool {
 }
 
 export function runWorker(workerData: WorkerData): Promise<HashResult> {
-  const trackId = workerData.trackId ?? getRequestContext()?.trackId ?? createUuidV7()
   const pool = getWorkerPool()
   hashJobsStarted.add(1)
   const stopTimer = startHashJobTimer()
 
-  return pool.run(workerData.payload, trackId)
+  return pool.run(workerData)
     .then((result) => {
       hashJobsCompleted.add(1)
       stopTimer()

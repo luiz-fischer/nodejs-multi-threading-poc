@@ -8,6 +8,22 @@ This project compares three ways of processing CPU-bound SHA-256 hashing in a No
 
 The experiment measures throughput, latency, event loop responsiveness, memory, CPU usage, queue pressure, and thread identity for every request.
 
+All three modes execute the same `executeHashTask` function with the same immutable workload contract:
+
+```json
+{
+  "workload": {
+    "payload": "same request content",
+    "algorithm": "sha256",
+    "encoding": "utf8",
+    "rounds": 10
+  },
+  "trackId": "request UUIDv7"
+}
+```
+
+Only the execution strategy changes: direct main-thread invocation, native worker-pool dispatch, or Piscina dispatch. Each response includes a deterministic `inputFingerprint` covering the payload hash and every workload parameter.
+
 ## Requirements
 
 - Node.js 20 or later
@@ -23,6 +39,7 @@ Node.js 20 is used because the application starts OpenTelemetry with the `--impo
 npm install
 npm run build
 npm run typecheck
+npm run test:workload-parity
 ```
 
 ## Run locally
@@ -73,9 +90,7 @@ Uses the reusable Piscina pool and is the recommended multithreaded endpoint. Th
 POST /api/raw-worker/hash
 ```
 
-Uses a fixed-size worker pool implemented directly with `worker_threads`. The response must report `mode: "worker-thread"`, `isMainThread: false`, and a positive `threadId`.
-
-This endpoint is useful for demonstrating worker isolation, but it includes worker startup and teardown overhead.
+Uses a fixed-size worker pool implemented directly with `worker_threads`. The same structured workload object used by the other modes is dispatched to one of five reusable workers. The response must report `mode: "worker-thread"`, `isMainThread: false`, and a positive `threadId`.
 
 ### Piscina worker pool
 
@@ -181,7 +196,7 @@ The default workload is:
 - 1,000 total requests
 - 32 concurrent clients
 - 900,000-byte payload
-- 30-second request timeout
+- 120-second request timeout
 
 Each request performs ten SHA-256 rounds over the full payload by default. Configure this with `HASH_ROUNDS` when a heavier or lighter CPU workload is required.
 
@@ -209,6 +224,10 @@ The test validates every successful response. It fails if:
 - a worker request runs on the main thread
 - a `trackId` is missing, invalid, or duplicated
 - fewer than two Piscina worker threads are observed
+- the payload hash or workload fingerprint differs from the shared contract
+- algorithm, encoding, rounds, or UTF-8 payload size differs between modes
+
+The full experiment also compares the JSON reports after all scenarios finish. It exits with an error unless all three reports contain the same hash and workload fingerprint.
 
 ## Reports and logs
 

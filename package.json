@@ -8,10 +8,11 @@
     "build": "tsc",
     "dev": "npm run build && node scripts/dev.mjs",
     "start": "node --import ./dist/instrumentation.js dist/index.js",
-    "experiment": "node scripts/run-experiment.mjs",
+    "experiment": "npm run build && node scripts/run-experiment.mjs",
     "stress": "node tests/stress.mjs",
+    "test:workload-parity": "npm run build && node tests/workload-parity.mjs",
     "typecheck": "tsc --noEmit",
-    "test": "npm run typecheck"
+    "test": "npm run typecheck && npm run test:workload-parity"
   },
   "keywords": [],
   "author": "",

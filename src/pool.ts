@@ -15,7 +15,6 @@ import {
   registerPoolMetrics,
   startHashJobTimer
 } from './metrics.js'
-import { createUuidV7, getRequestContext } from './track-context.js'
 import type { HashResult, PoolWorkerData, WorkerMessage } from './types.js'
 
 let piscina: Piscina<PoolWorkerData, WorkerMessage> | undefined
@@ -37,16 +36,13 @@ function getPool(): Piscina<PoolWorkerData, WorkerMessage> {
   return piscina
 }
 
-export async function hashWithPool(
-  payload: string,
-  trackId = getRequestContext()?.trackId ?? createUuidV7()
-): Promise<HashResult> {
+export async function hashWithPool(task: PoolWorkerData): Promise<HashResult> {
   const pool = getPool()
   hashJobsStarted.add(1)
   const stopTimer = startHashJobTimer()
 
   try {
-    const message = await pool.run({ payload, trackId })
+    const message = await pool.run(task)
 
     if (message.status === 'ok') {
       hashJobsCompleted.add(1)

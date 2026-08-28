@@ -8,7 +8,6 @@ import {
   APP_NAME,
   APP_VERSION,
   DEFAULT_PORT,
-  HASH_ROUNDS,
   MAX_HASH_PAYLOAD_LENGTH
 } from './const.js'
 import { hashWithPool, shutdownPool } from './pool.js'
@@ -17,8 +16,8 @@ import { getTelemetrySnapshot, shutdownTelemetry } from './instrumentation.js'
 import { createUuidV7, getRequestContext, runWithRequestContext } from './track-context.js'
 import { LOG_REQUESTS } from './const.js'
 import { writeLog } from './logger.js'
-import { hashPayload } from './hash.js'
-import type { HashRequestBody } from './types.js'
+import { createHashTask, executeHashTask } from './hash.js'
+import type { HashRequestBody, HashTask, HashTaskExecutor } from './types.js'
 
 const app = express()
 
@@ -91,82 +90,50 @@ app.get('/telemetry/resources', async (_req: Request, res: Response, next) => {
   }
 })
 
-// Single-thread comparison: the hash is calculated on the main event loop.
-app.post('/api/singlethread/hash', async (req: Request<unknown, unknown, Partial<HashRequestBody>>, res: Response, next) => {
-  const { text } = req.body
-
-  if (!isValidHashText(text)) {
-    res.status(400).json({ error: 'The "text" field must be a string with at most 1 MB' })
-    return
-  }
-
-  try {
-    const hash = hashPayload(text)
-    res.json({
-      hash,
-      execution: {
-        mode: 'single-thread',
-        isMainThread,
-        threadId,
-        pid: process.pid,
-        trackId: getRequestContext()?.trackId ?? createUuidV7(),
-        hashRounds: HASH_ROUNDS
-      }
-    })
-  } catch (error) {
-    next(error)
-  }
+const executeSingleThread: HashTaskExecutor = (task) => executeHashTask(task, {
+  mode: 'single-thread',
+  isMainThread,
+  threadId,
+  pid: process.pid
 })
 
-app.post('/api/pool/hash', async (req: Request<unknown, unknown, Partial<HashRequestBody>>, res: Response, next) => {
-  if (!isValidHashText(req.body.text)) {
-    res.status(400).json({ error: 'The "text" field must be a string with at most 1 MB' })
-    return
-  }
+app.post('/api/singlethread/hash', createHashEndpoint(executeSingleThread))
+app.post('/api/raw-worker/hash', createHashEndpoint(runWorker))
+app.post('/api/hash', createHashEndpoint(hashWithPool))
+app.post('/api/pool/hash', createHashEndpoint(hashWithPool))
 
-  try {
-    const trackId = getRequestContext()?.trackId ?? createUuidV7()
-    const result = await hashWithPool(req.body.text, trackId)
-    res.json(result)
-  } catch (error) {
-    next(error)
-  }
-})
+function createHashEndpoint(executor: HashTaskExecutor): RequestHandler {
+  return async (
+    req: Request<unknown, unknown, Partial<HashRequestBody>>,
+    res: Response,
+    next
+  ) => {
+    const { text } = req.body
 
-app.post('/api/hash', async (req: Request<unknown, unknown, Partial<HashRequestBody>>, res: Response, next) => {
-  if (!isValidHashText(req.body.text)) {
-    res.status(400).json({ error: 'The "text" field must be a string with at most 1 MB' })
-    return
-  }
+    if (!isValidHashText(text)) {
+      res.status(400).json({ error: 'The "text" field must be a string with at most 1 MB' })
+      return
+    }
 
-  try {
-    const trackId = getRequestContext()?.trackId ?? createUuidV7()
-    const result = await hashWithPool(req.body.text, trackId)
-    res.json(result)
-  } catch (error) {
-    next(error)
+    try {
+      const task = createRequestHashTask(text)
+      res.json(await executor(task))
+    } catch (error) {
+      next(error)
+    }
   }
-})
-
-app.post('/api/raw-worker/hash', async (req: Request<unknown, unknown, Partial<HashRequestBody>>, res: Response, next) => {
-  if (!isValidHashText(req.body.text)) {
-    res.status(400).json({ error: 'The "text" field must be a string with at most 1 MB' })
-    return
-  }
-
-  try {
-    const trackId = getRequestContext()?.trackId ?? createUuidV7()
-    const result = await runWorker({ payload: req.body.text, trackId })
-    res.json(result)
-  } catch (error) {
-    next(error)
-  }
-})
+}
 
 function isValidHashText(text: unknown): text is string {
   return typeof text === 'string' && text.length <= MAX_HASH_PAYLOAD_LENGTH
 }
 
+function createRequestHashTask(payload: string): HashTask {
+  return createHashTask(
+    payload,
+    getRequestContext()?.trackId ?? createUuidV7()
+  )
+}
 
 const errorHandler: ErrorRequestHandler = (error: unknown, _req, res, _next) => {
   const message = error instanceof Error ? error.message : 'Internal server error'

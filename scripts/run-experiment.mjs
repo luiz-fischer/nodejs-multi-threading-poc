@@ -1,4 +1,4 @@
-import { mkdir } from 'node:fs/promises'
+import { mkdir, readFile } from 'node:fs/promises'
 import { spawn } from 'node:child_process'
 import process from 'node:process'
 
@@ -7,8 +7,9 @@ const runId = new Date().toISOString().replace(/[:.]/g, '-')
 const requests = process.env.STRESS_REQUESTS ?? '1000'
 const concurrency = process.env.STRESS_CONCURRENCY ?? '32'
 const payloadBytes = process.env.STRESS_PAYLOAD_BYTES ?? '900000'
-const requestTimeout = process.env.STRESS_TIMEOUT_MS ?? '30000'
+const requestTimeout = process.env.STRESS_TIMEOUT_MS ?? '120000'
 const keepContainers = process.env.KEEP_CONTAINERS === 'true'
+const reportPaths = []
 
 const scenarios = [
   {
@@ -96,8 +97,31 @@ try {
 
     console.log(`\nStarting ${scenario.name} test against port ${scenario.port}`)
     await runCommand(process.platform === 'win32' ? 'npm.cmd' : 'npm', ['run', 'stress'], environment)
+    reportPaths.push(output)
     console.log(`Completed ${scenario.name} test: ${output}`)
   }
+
+  const workloadContracts = await Promise.all(reportPaths.map(async (reportPath) => {
+    const report = JSON.parse(await readFile(reportPath, 'utf8'))
+    const result = report.results?.[0]
+
+    if (!result?.hash || !result?.workload) {
+      throw new Error(`Missing workload proof in ${reportPath}`)
+    }
+
+    return {
+      scenario: result.endpoint,
+      hash: result.hash,
+      workload: result.workload
+    }
+  }))
+  const uniqueContracts = new Set(workloadContracts.map(({ hash, workload }) => JSON.stringify({ hash, workload })))
+
+  if (uniqueContracts.size !== 1) {
+    throw new Error(`Workload parity failed: ${JSON.stringify(workloadContracts)}`)
+  }
+
+  console.log(`\nWorkload parity validated: ${workloadContracts[0].workload.inputFingerprint}`)
 } catch (error) {
   experimentError = error
 } finally {

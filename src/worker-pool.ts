@@ -8,24 +8,16 @@ import {
 } from './const.js'
 import type {
   HashResult,
+  HashTask,
+  PendingWorkerPoolTask,
   WorkerPoolMessage,
+  WorkerPoolSlot,
   WorkerPoolTask
 } from './types.js'
 
-interface PendingTask {
-  task: WorkerPoolTask
-  resolve: (result: HashResult) => void
-  reject: (error: Error) => void
-}
-
-interface WorkerSlot {
-  worker: Worker
-  task?: PendingTask
-}
-
 export class WorkerPool {
-  private readonly queue: PendingTask[] = []
-  private readonly slots: WorkerSlot[]
+  private readonly queue: PendingWorkerPoolTask[] = []
+  private readonly slots: WorkerPoolSlot[]
   private nextTaskId = 0
   private closed = false
 
@@ -33,7 +25,7 @@ export class WorkerPool {
     this.slots = Array.from({ length: size }, () => this.createSlot())
   }
 
-  run(payload: string, trackId: string): Promise<HashResult> {
+  run(hashTask: HashTask): Promise<HashResult> {
     if (this.closed) {
       return Promise.reject(new Error('Worker pool is closed'))
     }
@@ -46,8 +38,7 @@ export class WorkerPool {
       this.queue.push({
         task: {
           taskId: `${process.pid}-${this.nextTaskId++}`,
-          payload,
-          trackId
+          hashTask
         },
         resolve,
         reject
@@ -65,8 +56,8 @@ export class WorkerPool {
     await Promise.all(this.slots.map(({ worker }) => worker.terminate()))
   }
 
-  private createSlot(): WorkerSlot {
-    const slot: WorkerSlot = {
+  private createSlot(): WorkerPoolSlot {
+    const slot: WorkerPoolSlot = {
       worker: new Worker(WORKER_PATH, {
         execArgv: WORKER_EXEC_ARGV,
         resourceLimits: WORKER_RESOURCE_LIMITS
@@ -88,7 +79,7 @@ export class WorkerPool {
     return slot
   }
 
-  private completeTask(slot: WorkerSlot, message: WorkerPoolMessage): void {
+  private completeTask(slot: WorkerPoolSlot, message: WorkerPoolMessage): void {
     const pendingTask = slot.task
     if (!pendingTask || pendingTask.task.taskId !== message.taskId) return
 
@@ -101,7 +92,7 @@ export class WorkerPool {
     this.dispatch()
   }
 
-  private failTask(slot: WorkerSlot, error: Error): void {
+  private failTask(slot: WorkerPoolSlot, error: Error): void {
     const pendingTask = slot.task
     slot.task = undefined
     pendingTask?.reject(error)
