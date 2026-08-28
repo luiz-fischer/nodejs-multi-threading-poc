@@ -1,0 +1,241 @@
+import process from 'node:process'
+import { performance } from 'node:perf_hooks'
+import {
+  STRESS_DEFAULT_CONCURRENCY,
+  STRESS_DEFAULT_PAYLOAD_BYTES,
+  STRESS_DEFAULT_REQUESTS,
+  STRESS_DEFAULT_TIMEOUT_MS
+} from '../dist/const.js'
+
+const baseUrl = process.env.BASE_URL ?? `http://127.0.0.1:${process.env.PORT ?? '3001'}`
+const totalRequests = Number(process.env.STRESS_REQUESTS ?? STRESS_DEFAULT_REQUESTS)
+const concurrency = Number(process.env.STRESS_CONCURRENCY ?? STRESS_DEFAULT_CONCURRENCY)
+const payloadBytes = Number(process.env.STRESS_PAYLOAD_BYTES ?? STRESS_DEFAULT_PAYLOAD_BYTES)
+const requestTimeoutMs = Number(process.env.STRESS_TIMEOUT_MS ?? STRESS_DEFAULT_TIMEOUT_MS)
+
+const cases = [
+  { name: 'single-thread', path: '/api/singlethread/hash', mode: 'single-thread' },
+  { name: 'worker-thread', path: '/api/hash', mode: 'worker-thread' },
+  { name: 'piscina', path: '/api/pool/hash', mode: 'piscina' }
+]
+
+if (!Number.isInteger(totalRequests) || totalRequests < 1) {
+  throw new Error('STRESS_REQUESTS must be a positive integer')
+}
+
+if (!Number.isInteger(concurrency) || concurrency < 1) {
+  throw new Error('STRESS_CONCURRENCY must be a positive integer')
+}
+
+const body = JSON.stringify({ text: 'x'.repeat(payloadBytes) })
+
+function isUuidV7(value) {
+  return typeof value === 'string' &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)
+}
+
+function percentile(values, fraction) {
+  if (values.length === 0) return 0
+  const sorted = [...values].sort((a, b) => a - b)
+  return sorted[Math.floor((sorted.length - 1) * fraction)]
+}
+
+function formatMs(value) {
+  return `${value.toFixed(2)} ms`
+}
+
+async function request(path, method = 'POST') {
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), requestTimeoutMs)
+  const startedAt = performance.now()
+
+  try {
+    const response = await fetch(`${baseUrl}${path}`, {
+      method,
+      headers: method === 'POST' ? { 'content-type': 'application/json' } : undefined,
+      body: method === 'POST' ? body : undefined,
+      signal: controller.signal
+    })
+    const contentType = response.headers.get('content-type') ?? ''
+    const data = contentType.includes('application/json')
+      ? await response.json()
+      : await response.text()
+
+    if (!response.ok) {
+      throw new Error(`${response.status}: ${JSON.stringify(data)}`)
+    }
+
+    return {
+      data,
+      durationMs: performance.now() - startedAt
+    }
+  } finally {
+    clearTimeout(timeout)
+  }
+}
+
+async function runCase(testCase) {
+  const durations = []
+  const probeDurations = []
+  const threadIds = new Set()
+  const trackIds = new Set()
+  const processIds = new Set()
+  const violations = []
+  const errors = []
+  const resourceSnapshots = []
+  let nextRequest = 0
+  let probing = true
+
+  const probe = (async () => {
+    while (probing) {
+      try {
+        const result = await request('/non-blocking/', 'GET')
+        probeDurations.push(result.durationMs)
+      } catch {
+        // The probe is diagnostic and must not hide the load-test result.
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100))
+    }
+  })()
+
+  const resourceMonitor = (async () => {
+    while (probing) {
+      try {
+        const result = await request('/telemetry/resources', 'GET')
+        resourceSnapshots.push(result.data)
+      } catch {
+        // Resource monitoring is diagnostic and must not hide load-test errors.
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250))
+    }
+  })()
+
+  const startedAt = performance.now()
+  const clients = Array.from({ length: Math.min(concurrency, totalRequests) }, async () => {
+    while (true) {
+      const requestNumber = nextRequest++
+      if (requestNumber >= totalRequests) return
+
+      try {
+        const result = await request(testCase.path)
+        const execution = result.data.execution
+
+        durations.push(result.durationMs)
+
+        if (!execution || execution.mode !== testCase.mode) {
+          violations.push({ requestNumber, reason: 'unexpected execution mode', execution })
+          continue
+        }
+
+        threadIds.add(execution.threadId)
+        processIds.add(execution.pid)
+        trackIds.add(execution.trackId)
+
+        if (testCase.mode === 'single-thread' &&
+            (execution.isMainThread !== true || execution.threadId !== 0)) {
+          violations.push({ requestNumber, reason: 'single-thread endpoint left the main thread', execution })
+        }
+
+        if (testCase.mode !== 'single-thread' &&
+            (execution.isMainThread !== false || execution.threadId <= 0)) {
+          violations.push({ requestNumber, reason: 'worker endpoint did not run on a worker thread', execution })
+        }
+
+        if (!isUuidV7(execution.trackId)) {
+          violations.push({ requestNumber, reason: 'missing or invalid UUIDv7 trackId', execution })
+        }
+      } catch (error) {
+        errors.push({ requestNumber, message: error instanceof Error ? error.message : String(error) })
+      }
+    }
+  })
+
+  await Promise.all(clients)
+  const elapsedMs = performance.now() - startedAt
+  probing = false
+  await probe
+  await resourceMonitor
+
+  if (errors.length > 0) {
+    throw new Error(`${testCase.name}: ${errors.length} request(s) failed. First error: ${errors[0].message}`)
+  }
+
+  if (violations.length > 0) {
+    throw new Error(`${testCase.name}: execution proof failed. First violation: ${JSON.stringify(violations[0])}`)
+  }
+
+  if (trackIds.size !== durations.length) {
+    throw new Error(`${testCase.name}: trackId is not unique per successful request (${trackIds.size}/${durations.length})`)
+  }
+
+  if (testCase.mode !== 'single-thread' && threadIds.size < 2) {
+    throw new Error(`${testCase.name}: only one worker thread observed; increase STRESS_REQUESTS or STRESS_CONCURRENCY`)
+  }
+
+  const resourceMetric = (name) => resourceSnapshots
+    .flatMap((snapshot) => snapshot.metrics?.[name] ?? [])
+    .filter((value) => Number.isFinite(value))
+    .map(Number)
+
+  const resourcePeak = (name) => Math.max(0, ...resourceMetric(name))
+
+  return {
+    endpoint: testCase.path,
+    requests: totalRequests,
+    concurrency,
+    payload: `${payloadBytes} bytes`,
+    totalMs: elapsedMs,
+    throughput: totalRequests / (elapsedMs / 1000),
+    p50Ms: percentile(durations, 0.5),
+    p95Ms: percentile(durations, 0.95),
+    p99Ms: percentile(durations, 0.99),
+    probeP95Ms: percentile(probeDurations, 0.95),
+    trackIds: trackIds.size,
+    resourceSamples: resourceSnapshots.length,
+    resourcePeaks: {
+      eventLoopLagSeconds: resourcePeak('app.event_loop.lag'),
+      heapUsedBytes: resourcePeak('app.process.heap.used'),
+      maxRssBytes: resourcePeak('app.process.memory.max_rss'),
+      userCpuSeconds: resourcePeak('app.process.cpu.user'),
+      poolQueueSize: resourcePeak('app.pool.queue.size')
+    },
+    threadIds: [...threadIds].sort((a, b) => a - b),
+    processIds: [...processIds]
+  }
+}
+
+console.log(`Stress test: ${baseUrl}`)
+console.log(`Requests=${totalRequests}, concurrency=${concurrency}, payload=${payloadBytes} bytes`)
+console.log('Each response is checked for mode, isMainThread, threadId and pid.')
+
+const results = []
+for (const testCase of cases) {
+  const result = await runCase(testCase)
+  results.push(result)
+  console.log(`\n${testCase.name} ${testCase.path}`)
+  console.log(`  throughput: ${result.throughput.toFixed(2)} req/s`)
+  console.log(`  p50/p95/p99: ${formatMs(result.p50Ms)} / ${formatMs(result.p95Ms)} / ${formatMs(result.p99Ms)}`)
+  console.log(`  /non-blocking/ probe p95: ${formatMs(result.probeP95Ms)}`)
+  console.log(`  OTel resource samples: ${result.resourceSamples}`)
+  console.log(`  OTel peaks: heap=${(result.resourcePeaks.heapUsedBytes / 1024 / 1024).toFixed(2)} MB, ` +
+    `RSS=${(result.resourcePeaks.maxRssBytes / 1024 / 1024).toFixed(2)} MB, ` +
+    `event-loop=${(result.resourcePeaks.eventLoopLagSeconds * 1000).toFixed(2)} ms, ` +
+    `CPU=${result.resourcePeaks.userCpuSeconds.toFixed(2)} s, ` +
+    `pool-queue=${result.resourcePeaks.poolQueueSize}`)
+  console.log(`  process IDs: ${result.processIds.join(', ') || 'none'}`)
+  console.log(`  worker thread IDs: ${result.threadIds.join(', ') || 'main thread only'}`)
+}
+
+console.log('\nComparison')
+console.table(results.map(({ endpoint, throughput, p50Ms, p95Ms, p99Ms, probeP95Ms, resourcePeaks, threadIds }) => ({
+  endpoint,
+  throughput: `${throughput.toFixed(2)} req/s`,
+  p50: formatMs(p50Ms),
+  p95: formatMs(p95Ms),
+  p99: formatMs(p99Ms),
+  probeP95: formatMs(probeP95Ms),
+  heapPeak: `${(resourcePeaks.heapUsedBytes / 1024 / 1024).toFixed(2)} MB`,
+  rssPeak: `${(resourcePeaks.maxRssBytes / 1024 / 1024).toFixed(2)} MB`,
+  eventLoopPeak: `${(resourcePeaks.eventLoopLagSeconds * 1000).toFixed(2)} ms`,
+  threads: threadIds.length === 0 ? 'main' : threadIds.join(',')
+})))

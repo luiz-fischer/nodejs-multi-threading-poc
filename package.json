@@ -8,6 +8,7 @@
     "build": "tsc",
     "dev": "npm run build && node scripts/dev.mjs",
     "start": "node --import ./dist/instrumentation.js dist/index.js",
+    "stress": "npm run build && node tests/stress.mjs",
     "typecheck": "tsc --noEmit",
     "test": "npm run typecheck"
   },
