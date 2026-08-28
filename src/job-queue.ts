@@ -5,6 +5,7 @@ import {
   JOB_QUEUE_INTERVAL_CAP,
   JOB_QUEUE_INTERVAL_MS
 } from './const.js'
+import { createUuidV7, getRequestContext } from './track-context.js'
 import type { HashJob, HashResult } from './types.js'
 
 const queue = new PQueue({
@@ -14,7 +15,9 @@ const queue = new PQueue({
 })
 
 export function enqueueHashJob(job: HashJob): Promise<HashResult> {
-  return queue.add<HashResult>(() => hashWithPool(job.text)).then((result) => {
+  const trackId = job.trackId ?? getRequestContext()?.trackId ?? createUuidV7()
+
+  return queue.add<HashResult>(() => hashWithPool(job.text, trackId)).then((result) => {
     if (result === undefined) {
       throw new Error('Hash job was removed from the queue')
     }

@@ -1,5 +1,7 @@
 import process from 'node:process'
 import { performance } from 'node:perf_hooks'
+import { mkdir, writeFile } from 'node:fs/promises'
+import { dirname, resolve } from 'node:path'
 import {
   STRESS_DEFAULT_CONCURRENCY,
   STRESS_DEFAULT_PAYLOAD_BYTES,
@@ -12,12 +14,21 @@ const totalRequests = Number(process.env.STRESS_REQUESTS ?? STRESS_DEFAULT_REQUE
 const concurrency = Number(process.env.STRESS_CONCURRENCY ?? STRESS_DEFAULT_CONCURRENCY)
 const payloadBytes = Number(process.env.STRESS_PAYLOAD_BYTES ?? STRESS_DEFAULT_PAYLOAD_BYTES)
 const requestTimeoutMs = Number(process.env.STRESS_TIMEOUT_MS ?? STRESS_DEFAULT_TIMEOUT_MS)
+const outputPath = resolve(process.env.STRESS_OUTPUT ?? `logs/stress-results-${Date.now()}.json`)
 
-const cases = [
+const allCases = [
   { name: 'single-thread', path: '/api/singlethread/hash', mode: 'single-thread' },
-  { name: 'worker-thread', path: '/api/hash', mode: 'worker-thread' },
-  { name: 'piscina', path: '/api/pool/hash', mode: 'piscina' }
+  { name: 'worker-thread', path: '/api/raw-worker/hash', mode: 'worker-thread' },
+  { name: 'piscina', path: '/api/hash', mode: 'piscina' }
 ]
+const selectedMode = process.env.STRESS_MODE ?? 'all'
+const cases = selectedMode === 'all'
+  ? allCases
+  : allCases.filter((testCase) => testCase.mode === selectedMode)
+
+if (cases.length === 0) {
+  throw new Error(`Unknown STRESS_MODE: ${selectedMode}`)
+}
 
 if (!Number.isInteger(totalRequests) || totalRequests < 1) {
   throw new Error('STRESS_REQUESTS must be a positive integer')
@@ -42,6 +53,25 @@ function percentile(values, fraction) {
 
 function formatMs(value) {
   return `${value.toFixed(2)} ms`
+}
+
+async function waitForServer() {
+  const deadline = Date.now() + 10_000
+  let lastError = 'health check did not return 200'
+
+  while (Date.now() < deadline) {
+    try {
+      const response = await fetch(`${baseUrl}/non-blocking/`)
+      if (response.ok) return
+      lastError = `health check returned HTTP ${response.status}`
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error)
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 250))
+  }
+
+  throw new Error(`Unable to connect to ${baseUrl}. Start the API first. Last error: ${lastError}`)
 }
 
 async function request(path, method = 'POST') {
@@ -80,6 +110,7 @@ async function runCase(testCase) {
   const threadIds = new Set()
   const trackIds = new Set()
   const processIds = new Set()
+  const hashRounds = new Set()
   const violations = []
   const errors = []
   const resourceSnapshots = []
@@ -130,6 +161,7 @@ async function runCase(testCase) {
         threadIds.add(execution.threadId)
         processIds.add(execution.pid)
         trackIds.add(execution.trackId)
+        hashRounds.add(execution.hashRounds)
 
         if (testCase.mode === 'single-thread' &&
             (execution.isMainThread !== true || execution.threadId !== 0)) {
@@ -143,6 +175,10 @@ async function runCase(testCase) {
 
         if (!isUuidV7(execution.trackId)) {
           violations.push({ requestNumber, reason: 'missing or invalid UUIDv7 trackId', execution })
+        }
+
+        if (!Number.isInteger(execution.hashRounds) || execution.hashRounds < 1) {
+          violations.push({ requestNumber, reason: 'invalid hashRounds value', execution })
         }
       } catch (error) {
         errors.push({ requestNumber, message: error instanceof Error ? error.message : String(error) })
@@ -168,6 +204,10 @@ async function runCase(testCase) {
     throw new Error(`${testCase.name}: trackId is not unique per successful request (${trackIds.size}/${durations.length})`)
   }
 
+  if (hashRounds.size !== 1) {
+    throw new Error(`${testCase.name}: inconsistent hashRounds across responses`)
+  }
+
   if (testCase.mode !== 'single-thread' && threadIds.size < 2) {
     throw new Error(`${testCase.name}: only one worker thread observed; increase STRESS_REQUESTS or STRESS_CONCURRENCY`)
   }
@@ -191,6 +231,7 @@ async function runCase(testCase) {
     p99Ms: percentile(durations, 0.99),
     probeP95Ms: percentile(probeDurations, 0.95),
     trackIds: trackIds.size,
+    hashRounds: [...hashRounds][0],
     resourceSamples: resourceSnapshots.length,
     resourcePeaks: {
       eventLoopLagSeconds: resourcePeak('app.event_loop.lag'),
@@ -208,27 +249,47 @@ console.log(`Stress test: ${baseUrl}`)
 console.log(`Requests=${totalRequests}, concurrency=${concurrency}, payload=${payloadBytes} bytes`)
 console.log('Each response is checked for mode, isMainThread, threadId and pid.')
 
+await waitForServer()
+
 const results = []
-for (const testCase of cases) {
-  const result = await runCase(testCase)
-  results.push(result)
-  console.log(`\n${testCase.name} ${testCase.path}`)
-  console.log(`  throughput: ${result.throughput.toFixed(2)} req/s`)
-  console.log(`  p50/p95/p99: ${formatMs(result.p50Ms)} / ${formatMs(result.p95Ms)} / ${formatMs(result.p99Ms)}`)
-  console.log(`  /non-blocking/ probe p95: ${formatMs(result.probeP95Ms)}`)
-  console.log(`  OTel resource samples: ${result.resourceSamples}`)
-  console.log(`  OTel peaks: heap=${(result.resourcePeaks.heapUsedBytes / 1024 / 1024).toFixed(2)} MB, ` +
-    `RSS=${(result.resourcePeaks.maxRssBytes / 1024 / 1024).toFixed(2)} MB, ` +
-    `event-loop=${(result.resourcePeaks.eventLoopLagSeconds * 1000).toFixed(2)} ms, ` +
-    `CPU=${result.resourcePeaks.userCpuSeconds.toFixed(2)} s, ` +
-    `pool-queue=${result.resourcePeaks.poolQueueSize}`)
-  console.log(`  process IDs: ${result.processIds.join(', ') || 'none'}`)
-  console.log(`  worker thread IDs: ${result.threadIds.join(', ') || 'main thread only'}`)
+try {
+  for (const testCase of cases) {
+    const result = await runCase(testCase)
+    results.push(result)
+    console.log(`\n${testCase.name} ${testCase.path}`)
+    console.log(`  hash rounds: ${result.hashRounds}`)
+    console.log(`  throughput: ${result.throughput.toFixed(2)} req/s`)
+    console.log(`  p50/p95/p99: ${formatMs(result.p50Ms)} / ${formatMs(result.p95Ms)} / ${formatMs(result.p99Ms)}`)
+    console.log(`  /non-blocking/ probe p95: ${formatMs(result.probeP95Ms)}`)
+    console.log(`  OTel resource samples: ${result.resourceSamples}`)
+    console.log(`  OTel peaks: heap=${(result.resourcePeaks.heapUsedBytes / 1024 / 1024).toFixed(2)} MB, ` +
+      `RSS=${(result.resourcePeaks.maxRssBytes / 1024 / 1024).toFixed(2)} MB, ` +
+      `event-loop=${(result.resourcePeaks.eventLoopLagSeconds * 1000).toFixed(2)} ms, ` +
+      `CPU=${result.resourcePeaks.userCpuSeconds.toFixed(2)} s, ` +
+      `pool-queue=${result.resourcePeaks.poolQueueSize}`)
+    console.log(`  process IDs: ${result.processIds.join(', ') || 'none'}`)
+    console.log(`  worker thread count: ${result.threadIds.length}`)
+    console.log(`  track IDs: ${result.trackIds}/${result.requests}`)
+  }
+} catch (error) {
+  await mkdir(dirname(outputPath), { recursive: true })
+  await writeFile(outputPath, JSON.stringify({
+    status: 'failed',
+    generatedAt: new Date().toISOString(),
+    baseUrl,
+    totalRequests,
+    concurrency,
+    payloadBytes,
+    results,
+    error: error instanceof Error ? error.message : String(error)
+  }, null, 2))
+  throw error
 }
 
 console.log('\nComparison')
-console.table(results.map(({ endpoint, throughput, p50Ms, p95Ms, p99Ms, probeP95Ms, resourcePeaks, threadIds }) => ({
+console.table(results.map(({ endpoint, hashRounds, throughput, p50Ms, p95Ms, p99Ms, probeP95Ms, resourcePeaks, threadIds }) => ({
   endpoint,
+  hashRounds,
   throughput: `${throughput.toFixed(2)} req/s`,
   p50: formatMs(p50Ms),
   p95: formatMs(p95Ms),
@@ -237,5 +298,18 @@ console.table(results.map(({ endpoint, throughput, p50Ms, p95Ms, p99Ms, probeP95
   heapPeak: `${(resourcePeaks.heapUsedBytes / 1024 / 1024).toFixed(2)} MB`,
   rssPeak: `${(resourcePeaks.maxRssBytes / 1024 / 1024).toFixed(2)} MB`,
   eventLoopPeak: `${(resourcePeaks.eventLoopLagSeconds * 1000).toFixed(2)} ms`,
-  threads: threadIds.length === 0 ? 'main' : threadIds.join(',')
+  threads: threadIds.length === 0 ? 'main' : threadIds.length
 })))
+
+await mkdir(dirname(outputPath), { recursive: true })
+await writeFile(outputPath, JSON.stringify({
+  status: 'completed',
+  generatedAt: new Date().toISOString(),
+  baseUrl,
+  totalRequests,
+  concurrency,
+  payloadBytes,
+  requestTimeoutMs,
+  results
+}, null, 2))
+console.log(`\nJSON report: ${outputPath}`)

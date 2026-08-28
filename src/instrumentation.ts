@@ -7,7 +7,9 @@ import {
   PeriodicExportingMetricReader
 } from '@opentelemetry/sdk-metrics'
 import { ConsoleSpanExporter } from '@opentelemetry/sdk-trace-node'
+import { isMainThread } from 'node:worker_threads'
 import {
+  OTEL_CONSOLE_EXPORTER_ENABLED,
   OTEL_METRIC_EXPORT_INTERVAL_MS
 } from './const.js'
 import type { ExportedMetric, MetricPoint, TelemetrySnapshot } from './types.js'
@@ -19,28 +21,41 @@ class LatestMetricExporter extends InMemoryMetricExporter {
   }
 }
 
-const memoryMetricExporter = new LatestMetricExporter(
-  AggregationTemporality.CUMULATIVE
-)
-const memoryMetricReader = new PeriodicExportingMetricReader({
-  exporter: memoryMetricExporter,
-  exportIntervalMillis: OTEL_METRIC_EXPORT_INTERVAL_MS
-})
+const memoryMetricExporter = isMainThread
+  ? new LatestMetricExporter(AggregationTemporality.CUMULATIVE)
+  : undefined
+const memoryMetricReader = memoryMetricExporter
+  ? new PeriodicExportingMetricReader({
+      exporter: memoryMetricExporter,
+      exportIntervalMillis: OTEL_METRIC_EXPORT_INTERVAL_MS
+    })
+  : undefined
+const metricReaders = memoryMetricReader ? [memoryMetricReader] : []
 
-const sdk = new NodeSDK({
-  traceExporter: new ConsoleSpanExporter(),
-  metricReaders: [
-    new PeriodicExportingMetricReader({
-      exporter: new ConsoleMetricExporter()
-    }),
-    memoryMetricReader
-  ],
-  instrumentations: [getNodeAutoInstrumentations()]
-})
+if (OTEL_CONSOLE_EXPORTER_ENABLED && isMainThread) {
+  metricReaders.unshift(new PeriodicExportingMetricReader({
+    exporter: new ConsoleMetricExporter()
+  }))
+}
 
-sdk.start()
+const sdk = isMainThread
+  ? new NodeSDK({
+      traceExporter: OTEL_CONSOLE_EXPORTER_ENABLED ? new ConsoleSpanExporter() : undefined,
+      metricReaders,
+      instrumentations: [getNodeAutoInstrumentations()]
+    })
+  : undefined
+
+sdk?.start()
 
 export async function getTelemetrySnapshot(): Promise<TelemetrySnapshot> {
+  if (!memoryMetricReader || !memoryMetricExporter) {
+    return {
+      timestamp: new Date().toISOString(),
+      metrics: {}
+    }
+  }
+
   await memoryMetricReader.forceFlush()
 
   const exportedMetrics = memoryMetricExporter.getMetrics()
@@ -72,5 +87,5 @@ export async function getTelemetrySnapshot(): Promise<TelemetrySnapshot> {
 }
 
 export async function shutdownTelemetry(): Promise<void> {
-  await sdk.shutdown()
+  await sdk?.shutdown()
 }

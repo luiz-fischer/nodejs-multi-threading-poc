@@ -1,5 +1,4 @@
 import express, { type ErrorRequestHandler, type Request, type RequestHandler, type Response } from 'express'
-import { createHash } from 'node:crypto'
 import { context as otelContext, SpanStatusCode, trace } from '@opentelemetry/api'
 import { isMainThread, threadId } from 'node:worker_threads'
 import process from 'node:process'
@@ -9,14 +8,16 @@ import {
   APP_NAME,
   APP_VERSION,
   DEFAULT_PORT,
-  HASH_ALGORITHM,
-  HASH_ENCODING,
+  HASH_ROUNDS,
   MAX_HASH_PAYLOAD_LENGTH
 } from './const.js'
-import { hashWithPool, piscina } from './pool.js'
-import { runWorker } from './worker.js'
+import { hashWithPool, shutdownPool } from './pool.js'
+import { runWorker, shutdownWorkerPool } from './worker.js'
 import { getTelemetrySnapshot, shutdownTelemetry } from './instrumentation.js'
 import { createUuidV7, getRequestContext, runWithRequestContext } from './track-context.js'
+import { LOG_REQUESTS } from './const.js'
+import { writeLog } from './logger.js'
+import { hashPayload } from './hash.js'
 import type { HashRequestBody } from './types.js'
 
 const app = express()
@@ -54,6 +55,15 @@ const requestContextMiddleware: RequestHandler = (req, res, next) => {
       span.setStatus({ code: SpanStatusCode.ERROR })
     }
     span.end()
+    if (LOG_REQUESTS) {
+      writeLog('info', 'request.completed', {
+        trackId: requestContext.trackId,
+        method: req.method,
+        route: req.path,
+        statusCode: res.statusCode,
+        durationMs
+      })
+    }
   }
 
   res.once('finish', endRequest)
@@ -91,7 +101,7 @@ app.post('/api/singlethread/hash', async (req: Request<unknown, unknown, Partial
   }
 
   try {
-    const hash = createHash(HASH_ALGORITHM).update(text, HASH_ENCODING).digest('hex')
+    const hash = hashPayload(text)
     res.json({
       hash,
       execution: {
@@ -99,7 +109,8 @@ app.post('/api/singlethread/hash', async (req: Request<unknown, unknown, Partial
         isMainThread,
         threadId,
         pid: process.pid,
-        trackId: getRequestContext()?.trackId ?? createUuidV7()
+        trackId: getRequestContext()?.trackId ?? createUuidV7(),
+        hashRounds: HASH_ROUNDS
       }
     })
   } catch (error) {
@@ -114,7 +125,8 @@ app.post('/api/pool/hash', async (req: Request<unknown, unknown, Partial<HashReq
   }
 
   try {
-    const result = await hashWithPool(req.body.text)
+    const trackId = getRequestContext()?.trackId ?? createUuidV7()
+    const result = await hashWithPool(req.body.text, trackId)
     res.json(result)
   } catch (error) {
     next(error)
@@ -128,8 +140,24 @@ app.post('/api/hash', async (req: Request<unknown, unknown, Partial<HashRequestB
   }
 
   try {
-    const hash = await runWorker({ payload: req.body.text })
-    res.json(hash)
+    const trackId = getRequestContext()?.trackId ?? createUuidV7()
+    const result = await hashWithPool(req.body.text, trackId)
+    res.json(result)
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.post('/api/raw-worker/hash', async (req: Request<unknown, unknown, Partial<HashRequestBody>>, res: Response, next) => {
+  if (!isValidHashText(req.body.text)) {
+    res.status(400).json({ error: 'The "text" field must be a string with at most 1 MB' })
+    return
+  }
+
+  try {
+    const trackId = getRequestContext()?.trackId ?? createUuidV7()
+    const result = await runWorker({ payload: req.body.text, trackId })
+    res.json(result)
   } catch (error) {
     next(error)
   }
@@ -149,7 +177,7 @@ app.use(errorHandler)
 
 const port = Number(ALL_ENVS.PORT ?? DEFAULT_PORT)
 const server = app.listen(port, () => {
-  console.log(`App listening on port ${port}`)
+  writeLog('info', 'server.started', { port })
 })
 
 let shuttingDown = false
@@ -165,10 +193,13 @@ async function shutdown(exitCode = 0): Promise<void> {
       })
     }
 
-    await piscina.destroy()
+    await shutdownWorkerPool()
+    await shutdownPool()
     await shutdownTelemetry()
   } catch (error) {
-    console.error('Error during shutdown:', error)
+    writeLog('error', 'server.shutdown_failed', {
+      error: error instanceof Error ? error.message : String(error)
+    })
     exitCode = 1
   }
 
@@ -177,9 +208,11 @@ async function shutdown(exitCode = 0): Promise<void> {
 
 server.on('error', (error: NodeJS.ErrnoException) => {
   if (error.code === 'EADDRINUSE') {
-    console.error(`Port ${port} is already in use`)
+    writeLog('error', 'server.port_in_use', { port })
   } else {
-    console.error('Server error:', error)
+    writeLog('error', 'server.failed', {
+      error: error.message
+    })
   }
   void shutdown(1)
 })

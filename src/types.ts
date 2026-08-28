@@ -6,6 +6,7 @@ export interface ExecutionInfo {
   threadId: number
   pid: number
   trackId: string
+  hashRounds: number
 }
 
 export interface HashResult {
@@ -43,6 +44,26 @@ export interface WorkerErrorMessage {
 
 export type WorkerMessage = WorkerSuccessMessage | WorkerErrorMessage
 
+export interface WorkerPoolTask {
+  taskId: string
+  payload: string
+  trackId: string
+}
+
+export interface WorkerPoolSuccessMessage {
+  taskId: string
+  status: 'ok'
+  result: HashResult
+}
+
+export interface WorkerPoolErrorMessage {
+  taskId: string
+  status: 'error'
+  message: string
+}
+
+export type WorkerPoolMessage = WorkerPoolSuccessMessage | WorkerPoolErrorMessage
+
 export interface RequestContext {
   trackId: string
   startedAt: bigint
@@ -50,6 +71,7 @@ export interface RequestContext {
 
 export interface HashJob {
   text: string
+  trackId?: string
 }
 
 export interface PoolMetricsSource {
@@ -74,4 +96,10 @@ export interface ExportedMetric {
 export interface TelemetrySnapshot {
   timestamp: string
   metrics: Record<string, number[]>
+}
+
+export type LogLevel = 'info' | 'error'
+
+export interface LogDetails {
+  [key: string]: unknown
 }

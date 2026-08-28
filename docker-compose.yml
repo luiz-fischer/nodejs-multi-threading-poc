@@ -1,0 +1,80 @@
+services:
+  single-thread:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: node-worker-single-thread
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      HASH_ROUNDS: ${HASH_ROUNDS:-10}
+      OTEL_SERVICE_NAME: node-worker-single-thread
+      OTEL_CONSOLE_EXPORTER: 'false'
+      LOG_FILE: /logs/server.ndjson
+      LOG_REQUESTS: ${LOG_REQUESTS:-false}
+    cpus: 4
+    mem_limit: 512m
+    volumes:
+      - ./logs/single-thread:/logs
+    ports:
+      - '3011:3000'
+    restart: 'no'
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: '3'
+
+  worker-thread:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: node-worker-thread
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      HASH_ROUNDS: ${HASH_ROUNDS:-10}
+      OTEL_SERVICE_NAME: node-worker-thread
+      OTEL_CONSOLE_EXPORTER: 'false'
+      WORKER_MAX_CONCURRENCY: 5
+      LOG_FILE: /logs/server.ndjson
+      LOG_REQUESTS: ${LOG_REQUESTS:-false}
+    cpus: 4
+    mem_limit: 512m
+    volumes:
+      - ./logs/worker-thread:/logs
+    ports:
+      - '3012:3000'
+    restart: 'no'
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: '3'
+
+  piscina:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: node-worker-piscina
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      HASH_ROUNDS: ${HASH_ROUNDS:-10}
+      OTEL_SERVICE_NAME: node-worker-piscina
+      OTEL_CONSOLE_EXPORTER: 'false'
+      PISCINA_MAX_THREADS: 5
+      LOG_FILE: /logs/server.ndjson
+      LOG_REQUESTS: ${LOG_REQUESTS:-false}
+    cpus: 4
+    mem_limit: 512m
+    volumes:
+      - ./logs/piscina:/logs
+    ports:
+      - '3013:3000'
+    restart: 'no'
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: '3'

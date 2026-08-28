@@ -1,12 +1,12 @@
-import { createHash } from 'node:crypto'
 import { isMainThread, threadId } from 'node:worker_threads'
 import process from 'node:process'
-import { HASH_ALGORITHM, HASH_ENCODING } from './const.js'
+import { HASH_ROUNDS } from './const.js'
+import { hashPayload } from './hash.js'
 import type { PoolWorkerData, WorkerMessage } from './types.js'
 
 export default function hashWorker({ payload, trackId }: PoolWorkerData): WorkerMessage {
   try {
-    const hash = createHash(HASH_ALGORITHM).update(payload, HASH_ENCODING).digest('hex')
+    const hash = hashPayload(payload)
     return {
       status: 'ok',
       result: {
@@ -16,7 +16,8 @@ export default function hashWorker({ payload, trackId }: PoolWorkerData): Worker
           isMainThread,
           threadId,
           pid: process.pid,
-          trackId
+          trackId,
+          hashRounds: HASH_ROUNDS
         }
       }
     }
