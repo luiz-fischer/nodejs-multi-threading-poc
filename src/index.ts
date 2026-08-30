@@ -11,9 +11,20 @@ import {
   MAX_HASH_PAYLOAD_LENGTH
 } from './const.js'
 import { hashWithPool, shutdownPool } from './pool.js'
-import { runWorker, shutdownWorkerPool } from './worker.js'
+import { shutdownWorkerPool } from './worker.js'
+import {
+  enqueueHashTask,
+  getHashJob,
+  isHashJobId,
+  shutdownHashQueue
+} from './bullmq.js'
 import { getTelemetrySnapshot, shutdownTelemetry } from './instrumentation.js'
-import { createUuidV7, getRequestContext, runWithRequestContext } from './track-context.js'
+import {
+  createUuidV7,
+  getRequestContext,
+  isUuidV7,
+  runWithRequestContext
+} from './track-context.js'
 import { LOG_REQUESTS } from './const.js'
 import { writeLog } from './logger.js'
 import { createHashTask, executeHashTask } from './hash.js'
@@ -98,7 +109,7 @@ const executeSingleThread: HashTaskExecutor = (task) => executeHashTask(task, {
 })
 
 app.post('/api/singlethread/hash', createHashEndpoint(executeSingleThread))
-app.post('/api/raw-worker/hash', createHashEndpoint(runWorker))
+app.post('/api/raw-worker/hash', createQueuedHashEndpoint())
 app.post('/api/hash', createHashEndpoint(hashWithPool))
 app.post('/api/pool/hash', createHashEndpoint(hashWithPool))
 
@@ -124,14 +135,90 @@ function createHashEndpoint(executor: HashTaskExecutor): RequestHandler {
   }
 }
 
+function createQueuedHashEndpoint(): RequestHandler {
+  return async (
+    req: Request<unknown, unknown, Partial<HashRequestBody>>,
+    res: Response,
+    next
+  ) => {
+    const { text } = req.body
+
+    if (!isValidHashText(text)) {
+      res.status(400).json({ error: 'The "text" field must be a string with at most 1 MB' })
+      return
+    }
+
+    const idempotencyKey = req.get('idempotency-key')
+    if (idempotencyKey && !isUuidV7(idempotencyKey)) {
+      res.status(400).json({ error: 'The Idempotency-Key header must be a UUIDv7' })
+      return
+    }
+
+    try {
+      const task = createRequestHashTask(text, idempotencyKey)
+      const submission = await enqueueHashTask(task)
+      res.location(submission.statusUrl).status(202).json(submission)
+    } catch (error) {
+      next(error)
+    }
+  }
+}
+
+const getQueuedHashResult: RequestHandler<{ jobId: string }> = async (
+  req: Request<{ jobId: string }>,
+  res: Response,
+  next
+) => {
+  const { jobId } = req.params
+
+  if (!isHashJobId(jobId)) {
+    res.status(400).json({ error: 'Invalid BullMQ hash job ID' })
+    return
+  }
+
+  try {
+    const job = await getHashJob(jobId)
+    if (!job) {
+      res.status(404).json({ error: 'Hash job not found', jobId })
+      return
+    }
+
+    res.setHeader('x-job-id', job.jobId)
+    if (job.status === 'completed' && job.result) {
+      res.status(200).json(job.result)
+      return
+    }
+
+    if (job.status === 'failed') {
+      res.status(500).json({
+        jobId: job.jobId,
+        trackId: job.trackId,
+        status: job.status,
+        error: job.error ?? 'Hash job failed'
+      })
+      return
+    }
+
+    res.status(202).json({
+      jobId: job.jobId,
+      trackId: job.trackId,
+      status: job.status
+    })
+  } catch (error) {
+    next(error)
+  }
+}
+
+app.get('/api/raw-worker/hash/:jobId', getQueuedHashResult)
+
 function isValidHashText(text: unknown): text is string {
   return typeof text === 'string' && text.length <= MAX_HASH_PAYLOAD_LENGTH
 }
 
-function createRequestHashTask(payload: string): HashTask {
+function createRequestHashTask(payload: string, trackId?: string): HashTask {
   return createHashTask(
     payload,
-    getRequestContext()?.trackId ?? createUuidV7()
+    trackId ?? getRequestContext()?.trackId ?? createUuidV7()
   )
 }
 
@@ -160,6 +247,7 @@ async function shutdown(exitCode = 0): Promise<void> {
       })
     }
 
+    await shutdownHashQueue()
     await shutdownWorkerPool()
     await shutdownPool()
     await shutdownTelemetry()

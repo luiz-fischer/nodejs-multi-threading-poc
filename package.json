@@ -4,11 +4,16 @@
   "type": "module",
   "description": "",
   "main": "dist/index.js",
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "build": "tsc",
     "dev": "npm run build && node scripts/dev.mjs",
     "start": "node --import ./dist/instrumentation.js dist/index.js",
     "experiment": "npm run build && node scripts/run-experiment.mjs",
+    "brute-force": "npm run build && node scripts/run-brute-force.mjs",
+    "brute-force:load": "node tests/brute-force.mjs",
     "stress": "node tests/stress.mjs",
     "test:workload-parity": "npm run build && node tests/workload-parity.mjs",
     "typecheck": "tsc --noEmit",
@@ -23,8 +28,10 @@
     "@opentelemetry/sdk-metrics": "^2.10.0",
     "@opentelemetry/sdk-node": "^0.221.0",
     "@opentelemetry/sdk-trace-node": "^2.10.0",
+    "bullmq": "^6.3.2",
     "dotenv": "^17.4.2",
     "express": "^4.18.2",
+    "ioredis": "^6.0.0",
     "p-queue": "^8.0.0",
     "piscina": "^4.9.3",
     "poolifier": "^2.0.0"

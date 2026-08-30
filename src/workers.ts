@@ -1,6 +1,6 @@
 import process from 'node:process'
 import { isMainThread, parentPort, threadId } from 'node:worker_threads'
-import { executeHashTask } from './hash.js'
+import { executeHashTask } from './hash-workload.js'
 import type { WorkerPoolTask } from './types.js'
 
 const workerPort = parentPort

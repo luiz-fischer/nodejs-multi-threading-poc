@@ -53,6 +53,8 @@ export interface HashRequestBody {
 
 export interface EnvTypes {
   PORT: string
+  REDIS_HOST: string
+  REDIS_PORT: string
 }
 
 export type WorkerData = HashTask
@@ -71,7 +73,7 @@ export interface WorkerErrorMessage {
 export type WorkerMessage = WorkerSuccessMessage | WorkerErrorMessage
 
 export interface WorkerPoolTask {
-  readonly taskId: string
+  readonly taskId: number
   readonly hashTask: HashTask
 }
 
@@ -81,19 +83,25 @@ export interface PendingWorkerPoolTask {
   readonly reject: (error: Error) => void
 }
 
+export interface ActiveWorkerPoolTask {
+  readonly taskId: number
+  readonly resolve: (result: HashResult) => void
+  readonly reject: (error: Error) => void
+}
+
 export interface WorkerPoolSlot {
   readonly worker: Worker
-  task?: PendingWorkerPoolTask
+  task?: ActiveWorkerPoolTask
 }
 
 export interface WorkerPoolSuccessMessage {
-  taskId: string
+  taskId: number
   status: 'ok'
   result: HashResult
 }
 
 export interface WorkerPoolErrorMessage {
-  taskId: string
+  taskId: number
   status: 'error'
   message: string
 }
@@ -117,6 +125,48 @@ export interface PoolMetricsSource {
     readonly maxThreads: number
   }
 }
+
+export interface BullMqHashJobData {
+  readonly trackId: string
+  readonly payloadPath: string
+  readonly workload: Omit<HashWorkloadInput, 'payload'>
+}
+
+export type HashJobQueueStatus =
+  | 'active'
+  | 'completed'
+  | 'delayed'
+  | 'failed'
+  | 'prioritized'
+  | 'waiting'
+  | 'waiting-children'
+  | 'unknown'
+
+export interface HashJobSubmission {
+  readonly jobId: string
+  readonly trackId: string
+  readonly status: HashJobQueueStatus
+  readonly statusUrl: string
+  readonly deduplicated: boolean
+}
+
+export interface HashJobSnapshot {
+  readonly jobId: string
+  readonly trackId: string
+  readonly status: HashJobQueueStatus
+  readonly result?: HashResult
+  readonly error?: string
+}
+
+export interface JobQueueCounts {
+  readonly waiting: number
+  readonly active: number
+  readonly completed: number
+  readonly failed: number
+  readonly delayed: number
+}
+
+export type JobQueueMetricsReader = () => Promise<JobQueueCounts>
 
 export interface MetricPoint {
   value?: unknown

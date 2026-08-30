@@ -1,6 +1,6 @@
 import { isMainThread, threadId } from 'node:worker_threads'
 import process from 'node:process'
-import { executeHashTask } from './hash.js'
+import { executeHashTask } from './hash-workload.js'
 import type { PoolWorkerData, WorkerMessage } from './types.js'
 
 export default function hashWorker(task: PoolWorkerData): WorkerMessage {

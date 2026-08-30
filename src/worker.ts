@@ -2,6 +2,7 @@ import {
   hashJobsCompleted,
   hashJobsFailed,
   hashJobsStarted,
+  registerPoolMetrics,
   startHashJobTimer
 } from './metrics.js'
 import { WorkerPool } from './worker-pool.js'
@@ -12,6 +13,7 @@ let workerPool: WorkerPool | undefined
 function getWorkerPool(): WorkerPool {
   if (!workerPool) {
     workerPool = new WorkerPool()
+    registerPoolMetrics(workerPool)
   }
 
   return workerPool

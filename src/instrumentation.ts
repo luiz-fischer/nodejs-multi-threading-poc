@@ -1,4 +1,3 @@
-import { getNodeAutoInstrumentations } from '@opentelemetry/auto-instrumentations-node'
 import { NodeSDK } from '@opentelemetry/sdk-node'
 import {
   AggregationTemporality,
@@ -31,6 +30,9 @@ const memoryMetricReader = memoryMetricExporter
     })
   : undefined
 const metricReaders = memoryMetricReader ? [memoryMetricReader] : []
+const instrumentations = OTEL_CONSOLE_EXPORTER_ENABLED
+  ? [(await import('@opentelemetry/auto-instrumentations-node')).getNodeAutoInstrumentations()]
+  : []
 
 if (OTEL_CONSOLE_EXPORTER_ENABLED && isMainThread) {
   metricReaders.unshift(new PeriodicExportingMetricReader({
@@ -44,7 +46,7 @@ const sdk = isMainThread
         ? [new SimpleSpanProcessor(new ConsoleSpanExporter())]
         : [],
       metricReaders,
-      instrumentations: [getNodeAutoInstrumentations()]
+      instrumentations
     })
   : undefined
 

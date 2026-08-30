@@ -10,19 +10,31 @@ import type {
   HashResult,
   HashTask,
   PendingWorkerPoolTask,
+  PoolMetricsSource,
   WorkerPoolMessage,
   WorkerPoolSlot,
   WorkerPoolTask
 } from './types.js'
 
-export class WorkerPool {
+export class WorkerPool implements PoolMetricsSource {
   private readonly queue: PendingWorkerPoolTask[] = []
   private readonly slots: WorkerPoolSlot[]
   private nextTaskId = 0
+  private completedTasks = 0
   private closed = false
+  readonly options: PoolMetricsSource['options']
 
   constructor(private readonly size = WORKER_MAX_CONCURRENCY) {
+    this.options = Object.freeze({ maxThreads: size })
     this.slots = Array.from({ length: size }, () => this.createSlot())
+  }
+
+  get queueSize(): number {
+    return this.queue.length
+  }
+
+  get completed(): number {
+    return this.completedTasks
   }
 
   run(hashTask: HashTask): Promise<HashResult> {
@@ -37,7 +49,7 @@ export class WorkerPool {
     return new Promise<HashResult>((resolve, reject) => {
       this.queue.push({
         task: {
-          taskId: `${process.pid}-${this.nextTaskId++}`,
+          taskId: this.nextTaskId++,
           hashTask
         },
         resolve,
@@ -81,9 +93,10 @@ export class WorkerPool {
 
   private completeTask(slot: WorkerPoolSlot, message: WorkerPoolMessage): void {
     const pendingTask = slot.task
-    if (!pendingTask || pendingTask.task.taskId !== message.taskId) return
+    if (!pendingTask || pendingTask.taskId !== message.taskId) return
 
     slot.task = undefined
+    this.completedTasks += 1
     if (message.status === 'ok') {
       pendingTask.resolve(message.result)
     } else {
@@ -95,6 +108,7 @@ export class WorkerPool {
   private failTask(slot: WorkerPoolSlot, error: Error): void {
     const pendingTask = slot.task
     slot.task = undefined
+    if (pendingTask) this.completedTasks += 1
     pendingTask?.reject(error)
     if (!this.closed) this.dispatch()
   }
@@ -105,7 +119,11 @@ export class WorkerPool {
       const pendingTask = this.queue.shift()
       if (!pendingTask) return
 
-      slot.task = pendingTask
+      slot.task = {
+        taskId: pendingTask.task.taskId,
+        resolve: pendingTask.resolve,
+        reject: pendingTask.reject
+      }
       slot.worker.postMessage(pendingTask.task)
     }
   }

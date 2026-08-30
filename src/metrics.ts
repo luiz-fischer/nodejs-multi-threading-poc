@@ -2,7 +2,7 @@ import { monitorEventLoopDelay } from 'node:perf_hooks'
 import process from 'node:process'
 import { metrics } from '@opentelemetry/api'
 import { OTEL_METER_NAME, OTEL_METER_VERSION } from './const.js'
-import type { PoolMetricsSource } from './types.js'
+import type { JobQueueMetricsReader, PoolMetricsSource } from './types.js'
 
 const meter = metrics.getMeter(OTEL_METER_NAME, OTEL_METER_VERSION)
 
@@ -35,6 +35,13 @@ meter.createObservableGauge('app.process.memory.external', {
   unit: 'By'
 }).addCallback((result) => {
   result.observe(process.memoryUsage().external)
+})
+
+meter.createObservableGauge('app.process.memory.rss', {
+  description: 'Current resident set size in bytes',
+  unit: 'By'
+}).addCallback((result) => {
+  result.observe(process.memoryUsage().rss)
 })
 
 meter.createObservableGauge('app.process.memory.max_rss', {
@@ -86,20 +93,51 @@ export function startHashJobTimer(): () => void {
 
 export function registerPoolMetrics(pool: PoolMetricsSource): void {
   meter.createObservableGauge('app.pool.queue.size', {
-    description: 'Number of tasks waiting in the Piscina queue'
+    description: 'Number of tasks waiting in the active worker pool queue'
   }).addCallback((result) => {
     result.observe(pool.queueSize)
   })
 
   meter.createObservableGauge('app.pool.threads.max', {
-    description: 'Configured maximum number of Piscina workers'
+    description: 'Configured maximum number of workers in the active pool'
   }).addCallback((result) => {
     result.observe(pool.options.maxThreads)
   })
 
   meter.createObservableGauge('app.pool.tasks.completed', {
-    description: 'Number of tasks completed by Piscina'
+    description: 'Number of tasks completed by the active worker pool'
   }).addCallback((result) => {
     result.observe(pool.completed)
   })
+}
+
+export function registerJobQueueMetrics(readCounts: JobQueueMetricsReader): void {
+  const waiting = meter.createObservableGauge('app.job_queue.waiting', {
+    description: 'Number of jobs waiting in the external job queue'
+  })
+  const active = meter.createObservableGauge('app.job_queue.active', {
+    description: 'Number of jobs active in the external job queue'
+  })
+  const completed = meter.createObservableGauge('app.job_queue.completed', {
+    description: 'Number of retained completed jobs in the external job queue'
+  })
+  const failed = meter.createObservableGauge('app.job_queue.failed', {
+    description: 'Number of retained failed jobs in the external job queue'
+  })
+  const delayed = meter.createObservableGauge('app.job_queue.delayed', {
+    description: 'Number of delayed jobs in the external job queue'
+  })
+
+  meter.addBatchObservableCallback(async (result) => {
+    try {
+      const counts = await readCounts()
+      result.observe(waiting, counts.waiting)
+      result.observe(active, counts.active)
+      result.observe(completed, counts.completed)
+      result.observe(failed, counts.failed)
+      result.observe(delayed, counts.delayed)
+    } catch {
+      return
+    }
+  }, [waiting, active, completed, failed, delayed])
 }

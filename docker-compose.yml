@@ -1,4 +1,31 @@
 services:
+  redis:
+    image: redis:7.4-alpine
+    container_name: node-worker-redis
+    command:
+      - redis-server
+      - --appendonly
+      - 'yes'
+      - --appendfsync
+      - everysec
+      - --maxmemory-policy
+      - noeviction
+    cpus: 1
+    mem_limit: 512m
+    volumes:
+      - bullmq-data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 2s
+      timeout: 2s
+      retries: 15
+    restart: 'no'
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: '3'
+
   single-thread:
     build:
       context: .
@@ -36,16 +63,26 @@ services:
       HASH_ROUNDS: ${HASH_ROUNDS:-10}
       OTEL_SERVICE_NAME: node-worker-thread
       OTEL_CONSOLE_EXPORTER: 'false'
-      WORKER_MAX_CONCURRENCY: 5
+      WORKER_MAX_CONCURRENCY: ${WORKER_MAX_CONCURRENCY:-3}
+      WORKER_MAX_QUEUE: ${WORKER_MAX_QUEUE:-64}
+      MALLOC_ARENA_MAX: ${MALLOC_ARENA_MAX:-2}
+      UV_THREADPOOL_SIZE: ${UV_THREADPOOL_SIZE:-1}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      BULLMQ_PAYLOAD_DIRECTORY: /var/lib/hash-payloads
       LOG_FILE: /logs/server.ndjson
       LOG_REQUESTS: ${LOG_REQUESTS:-false}
     cpus: 4
     mem_limit: 512m
     volumes:
       - ./logs/worker-thread:/logs
+      - bullmq-payloads:/var/lib/hash-payloads
     ports:
       - '3012:3000'
     restart: 'no'
+    depends_on:
+      redis:
+        condition: service_healthy
     logging:
       driver: json-file
       options:
@@ -64,6 +101,7 @@ services:
       OTEL_SERVICE_NAME: node-worker-piscina
       OTEL_CONSOLE_EXPORTER: 'false'
       PISCINA_MAX_THREADS: 5
+      PISCINA_MAX_QUEUE: ${PISCINA_MAX_QUEUE:-64}
       LOG_FILE: /logs/server.ndjson
       LOG_REQUESTS: ${LOG_REQUESTS:-false}
     cpus: 4
@@ -78,3 +116,7 @@ services:
       options:
         max-size: 20m
         max-file: '3'
+
+volumes:
+  bullmq-data:
+  bullmq-payloads:

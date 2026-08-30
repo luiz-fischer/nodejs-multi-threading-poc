@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'
 import {
+  BULLMQ_STATUS_POLL_INTERVAL_MS,
   STRESS_DEFAULT_CONCURRENCY,
   STRESS_DEFAULT_PAYLOAD_BYTES,
   STRESS_DEFAULT_REQUESTS,
@@ -19,7 +20,7 @@ const outputPath = resolve(process.env.STRESS_OUTPUT ?? `logs/stress-results-${D
 
 const allCases = [
   { name: 'single-thread', path: '/api/singlethread/hash', mode: 'single-thread' },
-  { name: 'worker-thread', path: '/api/raw-worker/hash', mode: 'worker-thread' },
+  { name: 'worker-thread', path: '/api/raw-worker/hash', mode: 'worker-thread', queued: true },
   { name: 'piscina', path: '/api/hash', mode: 'piscina' }
 ]
 const selectedMode = process.env.STRESS_MODE ?? 'all'
@@ -103,7 +104,7 @@ async function waitForServer() {
   throw new Error(`Unable to connect to ${baseUrl}. Start the API first. Last error: ${lastError}`)
 }
 
-async function request(path, method = 'POST') {
+async function request(path, method = 'POST', additionalHeaders = {}) {
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), requestTimeoutMs)
   const startedAt = performance.now()
@@ -111,7 +112,9 @@ async function request(path, method = 'POST') {
   try {
     const response = await fetch(`${baseUrl}${path}`, {
       method,
-      headers: method === 'POST' ? { 'content-type': 'application/json' } : undefined,
+      headers: method === 'POST'
+        ? { 'content-type': 'application/json', ...additionalHeaders }
+        : additionalHeaders,
       body: method === 'POST' ? body : undefined,
       signal: controller.signal
     })
@@ -126,7 +129,8 @@ async function request(path, method = 'POST') {
 
     return {
       data,
-      durationMs: performance.now() - startedAt
+      durationMs: performance.now() - startedAt,
+      statusCode: response.status
     }
   } catch (error) {
     if (controller.signal.aborted) {
@@ -137,6 +141,61 @@ async function request(path, method = 'POST') {
   } finally {
     clearTimeout(timeout)
   }
+}
+
+async function waitForQueuedResult(submission, startedAt) {
+  if (!submission || typeof submission.statusUrl !== 'string' || !submission.jobId) {
+    throw new Error(`Invalid BullMQ submission response: ${JSON.stringify(submission)}`)
+  }
+
+  const deadline = startedAt + requestTimeoutMs
+  while (performance.now() < deadline) {
+    const result = await request(submission.statusUrl, 'GET')
+
+    if (result.statusCode === 200 && result.data?.execution) {
+      return {
+        data: result.data,
+        durationMs: performance.now() - startedAt
+      }
+    }
+
+    if (result.statusCode !== 202) {
+      throw new Error(`Unexpected BullMQ job status response: ${result.statusCode}`)
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, BULLMQ_STATUS_POLL_INTERVAL_MS))
+  }
+
+  throw new Error(`BullMQ job ${submission.jobId} timed out after ${requestTimeoutMs} ms`)
+}
+
+async function executeTestRequest(testCase) {
+  const startedAt = performance.now()
+  const submission = await request(testCase.path)
+  if (!testCase.queued) return submission
+  return waitForQueuedResult(submission.data, startedAt)
+}
+
+async function verifyBullMqIdempotency(testCase) {
+  if (!testCase.queued) return
+
+  const first = await request(testCase.path)
+  const idempotencyKey = first.data?.trackId
+  if (!isUuidV7(idempotencyKey)) {
+    throw new Error(`BullMQ submission returned an invalid trackId: ${JSON.stringify(first.data)}`)
+  }
+
+  const duplicate = await request(testCase.path, 'POST', {
+    'idempotency-key': idempotencyKey
+  })
+
+  if (first.data.jobId !== duplicate.data?.jobId || duplicate.data?.deduplicated !== true) {
+    throw new Error(
+      `BullMQ idempotency validation failed: ${JSON.stringify({ first: first.data, duplicate: duplicate.data })}`
+    )
+  }
+
+  await waitForQueuedResult(first.data, performance.now())
 }
 
 async function runCase(testCase) {
@@ -186,7 +245,7 @@ async function runCase(testCase) {
       if (requestNumber >= totalRequests) return
 
       try {
-        const result = await request(testCase.path)
+        const result = await executeTestRequest(testCase)
         const execution = result.data.execution
         const workload = result.data.workload
 
@@ -288,6 +347,9 @@ async function runCase(testCase) {
 
   const resourcePeak = (name) => Math.max(0, ...resourceMetric(name))
 
+  const poolQueueSize = resourcePeak('app.pool.queue.size')
+  const jobQueueWaiting = resourcePeak('app.job_queue.waiting')
+
   return {
     endpoint: testCase.path,
     requests: totalRequests,
@@ -309,7 +371,9 @@ async function runCase(testCase) {
       heapUsedBytes: resourcePeak('app.process.heap.used'),
       maxRssBytes: resourcePeak('app.process.memory.max_rss'),
       userCpuSeconds: resourcePeak('app.process.cpu.user'),
-      poolQueueSize: resourcePeak('app.pool.queue.size')
+      poolQueueSize,
+      jobQueueWaiting,
+      queueSize: Math.max(poolQueueSize, jobQueueWaiting)
     },
     threadIds: [...threadIds].sort((a, b) => a - b),
     processIds: [...processIds]
@@ -325,6 +389,7 @@ await waitForServer()
 const results = []
 try {
   for (const testCase of cases) {
+    await verifyBullMqIdempotency(testCase)
     const result = await runCase(testCase)
     results.push(result)
     console.log(`\n${testCase.name} ${testCase.path}`)
@@ -337,7 +402,7 @@ try {
       `RSS=${(result.resourcePeaks.maxRssBytes / 1024 / 1024).toFixed(2)} MB, ` +
       `event-loop=${(result.resourcePeaks.eventLoopLagSeconds * 1000).toFixed(2)} ms, ` +
       `CPU=${result.resourcePeaks.userCpuSeconds.toFixed(2)} s, ` +
-      `pool-queue=${result.resourcePeaks.poolQueueSize}`)
+      `queue=${result.resourcePeaks.queueSize}`)
     console.log(`  process IDs: ${result.processIds.join(', ') || 'none'}`)
     console.log(`  worker thread count: ${result.threadIds.length}`)
     console.log(`  track IDs: ${result.trackIds}/${result.requests}`)
